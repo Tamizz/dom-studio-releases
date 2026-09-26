@@ -1,0 +1,9 @@
+{
+  "name": "dom-studio-recording-harness",
+  "private": true,
+  "description": "Drives an unpacked DOM Studio build through local step-wizard, modal and phone-route pages.",
+  "devDependencies": {
+    "electron": "33.4.11",
+    "playwright-core": "1.56.1"
+  }
+}

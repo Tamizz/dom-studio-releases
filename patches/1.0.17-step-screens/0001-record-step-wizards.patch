@@ -1,0 +1,1484 @@
+From 3d26b3b0562dd00d8528dbff81c7a998904e92ca Mon Sep 17 00:00:00 2001
+From: Tamizz <andre.tamiazzo@gmail.com>
+Date: Sat, 26 Sep 2026 00:55:37 +0000
+Subject: [PATCH] Record ?step= wizards as screens, keep Send link on, save
+ without loading waits
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Send link: the ⋯ menu items no longer grey out when the two sides "look
+like the same page". That test used the query-blind page key, so DoorDash's
+?step=menu and ?step=choose-package read as one page and both items died
+exactly when they were needed. Each item now shows the link it sends.
+
+Screen params: the page key (rawDocKey / documentUrlKey) keeps the values
+of step-like query params — step, stage, phase and names built on them,
+plus screen. A new ?step= is a new screen on both sides, the phone is moved
+to the desktop's step when a mirrored click left it behind, and the rest of
+the query (modals such as ?mod=quickView, filters, tracking) still never
+makes a screen. A page that writes its own first step with no click is not
+a new screen.
+
+URL changes panel (recording inspector): every URL change on either side,
+which params moved, and whether it made a new screen. Params can be added
+(+ tab, or typed) or dropped for the current recording only; adding one
+saves the view already on screen. Every recording starts from the defaults.
+
+Saving: loading states are no longer kept, so nothing waits for them.
+Short pages are pages, not skeletons (no more 10 s wait); loading markers
+and images hold a save for 2.5 s at most, a busy DOM for 3 s. A click on a
+page still settling saves it right away. Loading frames are captured only
+when a screen is marked Loading. The phone is not moved off a page while it
+captures it. Stop saves when the page reports its last events are in
+instead of after a fixed 8 s.
+
+Rules for all of this: .claude/rules/recording.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LHBDQ31CR7gxkVwXtzjyZP
+---
+ .claude/rules/recording.md |  60 +++++
+ guest-preload.js           | 207 +++++++++++----
+ renderer/app.js            | 529 +++++++++++++++++++++++++++++++++++--
+ renderer/index.html        |  10 +
+ renderer/styles.css        | 185 +++++++++++++
+ 5 files changed, 926 insertions(+), 65 deletions(-)
+ create mode 100644 .claude/rules/recording.md
+
+diff --git a/.claude/rules/recording.md b/.claude/rules/recording.md
+new file mode 100644
+index 0000000..5b4f1d7
+--- /dev/null
++++ b/.claude/rules/recording.md
+@@ -0,0 +1,60 @@
++# Recording rules
++
++How DOM Studio decides what to save while recording. Every change to capture,
++phone-twin or save logic follows these rules. If a rule has to change, change it
++here in the same commit.
++
++## Save fast — loading states are not kept
++
++- A page is saved as soon as its DOM has been still for about half a second
++  (`QUIET_LOADED_MS`). Never wait to preserve a loading or skeleton state.
++- Loading markers (spinners, skeleton or shimmer classes, `aria-busy`, image
++  slots with no source) and images still downloading hold a save for
++  `LOADING_WAIT_MAX_MS` (2.5 s) at most. A page that never goes quiet is saved
++  at `LOAD_MAX_WAIT_MS` (3 s).
++- A short page is a page. Word counts (`pageLooksLikeShell`) never hold a save;
++  they only start a background watch that replaces the card if the page fills
++  in later (`watchShellFill`).
++- A click on a page whose capture is still waiting saves it right then, before
++  the click moves the page on (`finishLoadNow`).
++- Loading frames are captured only when a screen is marked Loading
++  (`recWantsLoadingNow`). No other page pays for one.
++- Stop saves as soon as the page reports `ds-stopped` (its last events are
++  flushed). `SAVE_GRACE_MS` is only the ceiling for a page that never answers.
++
++## What makes a new screen
++
++- A screen is a page key: origin + path + hash route + screen params. The rest
++  of the query never makes a screen — modals (`?mod=quickView`), filters,
++  tracking tags.
++- Default screen params: `step`, `stage`, `phase` and names built on them
++  (`currentStep`, `onboarding_step`, `step_id`), plus `screen`.
++- The URL changes panel adds any other param (a tab, a view, even a modal) or
++  drops a default, for the current recording only. Every recording starts from
++  the defaults.
++- The page key is built in two places that must stay identical: `rawDocKey` in
++  `renderer/app.js` and `documentUrlKey` in `guest-preload.js`. Change both or
++  neither. Guests get the rules with every message that can arm them
++  (`guestScreenParams()`).
++- A page that writes its own first step with no click (lands on `/onboarding`,
++  then `?step=welcome`) is still the page being captured, not a new screen.
++
++## Desktop and phone
++
++- Both sides walk together: a click on one is mirrored on the other. If the
++  other side is left on another step of the same page (the mirrored click did
++  nothing), it follows the source's URL (`settleMirroredStep`). A side on a
++  different page may show the same state its own way (Uber's phone routes) and
++  is left where it is.
++- Never move the phone while it is capturing another screen's mobile frame. Its
++  capture queue brings it to the next page.
++- Send link (⋯ menu) is available whenever both sides are up. Never grey it out
++  on a "same page" guess.
++
++## Checking a change
++
++Run the app against a local page that moves `?step=` with `pushState`, opens a
++modal through a query param, and sends the phone to its own route. Check, on
++both sides: every step becomes one screen with its mobile frame, the modal adds
++none, the phone follows, and the time from click to saved and from Stop to
++saved.
+diff --git a/guest-preload.js b/guest-preload.js
+index 8e23e20..749b07c 100644
+--- a/guest-preload.js
++++ b/guest-preload.js
+@@ -95,6 +95,22 @@ function applyWantLoading(opts) {
+   if (opts && typeof opts === 'object' && Object.prototype.hasOwnProperty.call(opts, 'warm')) {
+     warmVisible = !!opts.warm;
+   }
++  if (opts && typeof opts === 'object' && opts.screenParams) applyScreenParams(opts.screenParams);
++}
++
++// Which query params make a new screen, as the host has them for this
++// recording (see screenParamPairs). A change to them is not a hop: the page
++// is re-filed under its new key, so it neither captures nor folds anything.
++function applyScreenParams(next) {
++  const add = Array.isArray(next.add) ? next.add.map((p) => String(p).toLowerCase()) : [];
++  const drop = Array.isArray(next.drop) ? next.drop.map((p) => String(p).toLowerCase()) : [];
++  if (add.join('\n') === screenParamRules.add.join('\n') && drop.join('\n') === screenParamRules.drop.join('\n')) return;
++  const before = pageUrlKey(location.href);
++  screenParamRules = { add, drop };
++  const after = pageUrlKey(location.href);
++  if (lastPageUrlKey === before) lastPageUrlKey = after;
++  if (activeSnapDocKey === before) activeSnapDocKey = after;
++  if (loadingSentPath === before) loadingSentPath = after;
+ }
+ let snapGroupSeq = 0;
+ function nextGroup() {
+@@ -103,12 +119,14 @@ function nextGroup() {
+ }
+ 
+ const LOAD_MIN_WAIT_MS = 800;
+-const LOAD_MAX_WAIT_MS = 8000;
++const LOAD_MAX_WAIT_MS = 3000; // a page that never goes quiet is saved as it is
+ const LOAD_EARLY_MIN_MS = 50;
+ const LOAD_EARLY_MAX_MS = 400;
+ const CLICK_MIN_WAIT_MS = 400;
+ const CLICK_MAX_WAIT_MS = 6000;
+-const ABSOLUTE_MAX_MS = 10000; // only if images are still downloading
++// Loading markers (spinners, skeletons) and images still downloading hold a
++// save this long at most. Loading states are not something a save waits for.
++const LOADING_WAIT_MAX_MS = 2500;
+ const QUIET_MS = 400;
+ const QUIET_LOADED_MS = 450;
+ const EARLY_QUIET_MS = 180; // phase A: first frame that stops moving
+@@ -227,22 +245,71 @@ function bakeInlineStyle(el) {
+   return prev + (prev && !prev.endsWith(';') ? ';' : '') + parts.join(';');
+ }
+ 
++// Query params that are the page's route (?step=menu): a new value is a new
++// screen. Everything else in the query — modals, filters, tracking — stays
++// the same screen. Keep paramWords … screenParamPairs in sync with
++// renderer/app.js, which explains the rules.
++const SCREEN_PARAM_WORDS = ['step', 'stage', 'phase'];
++const NO_SCREEN_PARAMS = { add: [], drop: [], off: true };
++let screenParamRules = { add: [], drop: [] };
++
++function paramWords(name) {
++  return String(name || '')
++    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
++    .toLowerCase()
++    .split(/[^a-z0-9]+/)
++    .filter(Boolean);
++}
++
++function isDefaultScreenParam(name) {
++  const words = paramWords(name);
++  if (words.length === 1 && words[0] === 'screen') return true;
++  return words.length > 0 && words.length <= 3 && words.some((w) => SCREEN_PARAM_WORDS.includes(w));
++}
++
++function screenParamOn(name, rules = screenParamRules) {
++  const key = String(name || '').toLowerCase();
++  if (!key || rules.off || rules.drop.includes(key)) return false;
++  return rules.add.includes(key) || isDefaultScreenParam(name);
++}
++
++function screenParamPairs(search, rules = screenParamRules) {
++  const pairs = [];
++  const seen = new Set();
++  for (const [k, v] of new URLSearchParams(search || '')) {
++    if (!v || seen.has(k) || !screenParamOn(k, rules)) continue;
++    seen.add(k);
++    pairs.push(`${k}=${v}`);
++  }
++  return pairs.sort();
++}
++
+ // Cheap fingerprint of the page scaffolding: normalized URL + tags/roles/ids
+ // of the shallow DOM. Stable across data changes (list lengths, timestamps),
+ // different when a menu/dialog/skeleton is on screen — that's what lets the
+ // host recognise "back to Home" without merging distinct UI states.
+-function documentUrlKey(href) {
++function documentUrlKey(href, rules = screenParamRules) {
+   try {
+     const u = new URL(href || location.href);
+     const path = u.pathname.replace(/\/+$/, '') || '/';
+     const rawHash = u.hash || '';
+-    const route = /^#\/+/.test(rawHash) || rawHash.startsWith('#!/') ? rawHash.split('?')[0] : '';
+-    return `${u.origin}${path}${route}`;
++    const hashRoute = /^#\/+/.test(rawHash) || rawHash.startsWith('#!/');
++    const [route, ...routeQuery] = hashRoute ? rawHash.split('?') : [''];
++    const query = screenParamPairs(u.search, rules);
++    const routeParams = screenParamPairs(routeQuery.join('?'), rules);
++    return `${u.origin}${path}${query.length ? `?${query.join('&')}` : ''}${route}${routeParams.length ? `?${routeParams.join('&')}` : ''}`;
+   } catch {
+     return String(href || location.href || '');
+   }
+ }
+ 
++// The page landed without a step and wrote its own (/onboarding →
++// /onboarding?step=welcome): the key had no screen params and the page is
++// the same apart from them.
++function screenParamsFilledIn(prevKey, href) {
++  return !!prevKey && !prevKey.includes('?') && documentUrlKey(href, NO_SCREEN_PARAMS) === prevKey;
++}
++
+ function normalizedUrl() {
+   return documentUrlKey(location.href);
+ }
+@@ -853,7 +920,13 @@ function captureSnapshot(trigger, opts = {}) {
+   if (!frame) return;
+   const shellWords = wordsOutsideDialogs();
+   const stillSparseShell = (pageLooksLikeShell() && shellWords < 280) || (frame.words || 0) < 120;
+-  if (early && !alreadySentLoadingForPath(group)) {
++  // Settled saves go out at once — a short page is a page, not a skeleton to
++  // wait out. If it was still filling in after all, the filled-in frame
++  // replaces the card when it comes (watchShellFill).
++  const fillLater = stillSparseShell && !opts.final && (trigger === 'load' || settledGroups.has(group));
++  // The frame the page showed while still filling in goes out first only when
++  // this recording keeps loading states (a screen marked Loading).
++  if (wantLoading && early && !alreadySentLoadingForPath(group)) {
+     // Keep the early frame only when it was a shell the settled page replaced.
+     // A dense previous SPA route must not become loadingHtml on the new URL.
+     const changed = early.skeleton !== frame.skeleton;
+@@ -864,30 +937,13 @@ function captureSnapshot(trigger, opts = {}) {
+     if (htmlDiff && earlyShell && (changed || grew || trigger === 'load')) {
+       sendFrame(early, trigger, 'loading', group, click);
+       markLoadingSent(group);
+-      if (stillSparseShell) {
+-        // Only the skeleton went out — the page's card comes when it fills.
+-        watchShellFill(group, trigger, frame.words || 0, false, null);
+-        return;
+-      }
+       sendFrame(frame, trigger, 'loaded', group, null);
+-      return;
+-    }
+-  }
+-  if (stillSparseShell && trigger !== 'force' && trigger !== 'interaction') {
+-    if (alreadySentLoadingForPath(group)) {
+-      sendFrame(frame, trigger, 'loaded', group, click);
+-      watchShellFill(group, trigger, frame.words || 0, true, null);
+-      return;
+-    }
+-    if (trigger === 'load') {
+-      sendFrame(frame, trigger, 'loading', group, click);
+-      markLoadingSent(group);
+-      watchShellFill(group, trigger, frame.words || 0, false, click);
++      if (fillLater) watchShellFill(group, trigger, frame.words || 0, true, null);
+       return;
+     }
+   }
+   sendFrame(frame, trigger, opts.state || 'loaded', group, click);
+-  if (settledGroups.has(group) && stillSparseShell) watchShellFill(group, trigger, frame.words || 0, true, null);
++  if (fillLater) watchShellFill(group, trigger, frame.words || 0, true, null);
+ }
+ 
+ // A load job can settle on a skeleton that the placeholder check did not flag
+@@ -919,7 +975,7 @@ function watchShellFill(group, trigger, words0, fill, click) {
+         },
+         300,
+         4000,
+-        { quietMs: QUIET_LOADED_MS, hardMax: true }
++        { quietMs: QUIET_LOADED_MS }
+       );
+       return;
+     }
+@@ -966,6 +1022,14 @@ function isVisibleBox(el, minW, minH) {
+ }
+ 
+ function hasLoadingIndicators() {
++  if (hasLoadingMarkers()) return true;
++  return pageLooksLikeShell();
++}
++
++// What the page itself shows as loading — busy regions, skeleton / shimmer /
++// spinner classes, image slots with no source yet — as opposed to a page
++// that is merely short (pageLooksLikeShell).
++function hasLoadingMarkers() {
+   if (document.querySelector('[aria-busy="true"]')) return true;
+   let nodes;
+   try {
+@@ -993,7 +1057,35 @@ function hasLoadingIndicators() {
+   } catch {
+     /* ignore */
+   }
+-  return pageLooksLikeShell();
++  return false;
++}
++
++// A load capture still waiting for its page to settle is saved as it is now
++// when the user clicks that page: they are looking at it, and the click is
++// about to move it on. Clicking on through a wizard (DoorDash onboarding)
++// otherwise let each step's capture be aborted by the next step's, and only
++// the last step survived.
++let activeLoadJob = null; // { group, click, gen }
++
++function finishLoadNow() {
++  const job = activeLoadJob;
++  if (!job || job.gen !== snapGen || snapshotOnly) return false;
++  activeLoadJob = null;
++  try {
++    captureSnapshot('load', { group: job.group, click: job.click, state: 'loaded', final: true });
++  } finally {
++    stopWalkCapture();
++    // Ends the job's settle wait (and any shell watch) without a second frame.
++    snapGen += 1;
++    snapBusy = false;
++    activeSnapGroup = '';
++    activeSnapTrigger = '';
++    activeSnapDocKey = '';
++  }
++  if (snapQueue.length) runSnapJob(snapQueue.shift());
++  else if (pendingStop) finishStop();
++  else if (captureSession) ensureRrweb();
++  return true;
+ }
+ 
+ function flushSearchWalkStep() {
+@@ -1014,10 +1106,11 @@ function abortSnapWait() {
+   showCaptureOverlay(false);
+ }
+ 
+-// Wait until the page is truly settled: no DOM mutations for QUIET_MS, images
+-// loaded, and (when requested) no skeleton/shimmer placeholders left.
++// Wait until the page has settled: no DOM mutations for quietMs, and (for a
++// short while — LOADING_WAIT_MAX_MS) no images still downloading and, when
++// requested, no loading markers. A page that is merely short is not loading.
+ function waitForSettled(done, minMs, maxMs, opts = {}) {
+-  const { requireNoLoading = false, quietMs = QUIET_MS, hardMax = false, acceptDropdown = false } = opts;
++  const { requireNoLoading = false, quietMs = QUIET_MS, acceptDropdown = false } = opts;
+   const gen = snapGen;
+   const start = Date.now();
+   let lastMut = Date.now();
+@@ -1065,8 +1158,9 @@ function waitForSettled(done, minMs, maxMs, opts = {}) {
+     }
+     const elapsed = Date.now() - start;
+     const quietFor = Date.now() - lastMut;
+-    const imagesPending = hasPendingImages();
+-    const loadingClear = !requireNoLoading || !hasLoadingIndicators();
++    const holding = elapsed < LOADING_WAIT_MAX_MS;
++    const imagesPending = holding && hasPendingImages();
++    const loadingClear = !requireNoLoading || !holding || !hasLoadingMarkers();
+     const overlayReady = acceptDropdown && overlayLayerKind() === 'dropdown';
+     const settled =
+       elapsed >= minMs && (overlayReady || (quietFor >= quietMs && !imagesPending && loadingClear));
+@@ -1075,16 +1169,9 @@ function waitForSettled(done, minMs, maxMs, opts = {}) {
+       obs.disconnect();
+       if (!cancelled()) done();
+     } else if (elapsed >= maxMs) {
+-      // When we asked for a settled (non-skeleton) frame, keep waiting through
+-      // ABSOLUTE_MAX — Uber-style shells go quiet while placeholders remain.
+-      if (requireNoLoading && !loadingClear && elapsed < ABSOLUTE_MAX_MS) {
+-        setTimeout(tick, 80);
+-      } else if (hardMax || !imagesPending || elapsed >= ABSOLUTE_MAX_MS) {
+-        obs.disconnect();
+-        if (!cancelled()) done();
+-      } else {
+-        setTimeout(tick, 80);
+-      }
++      // Never quiet (tickers, carousels, ads): saved as it is now.
++      obs.disconnect();
++      if (!cancelled()) done();
+     } else {
+       setTimeout(tick, 80);
+     }
+@@ -1123,6 +1210,7 @@ function runSnapJob(job) {
+   // The click meta belongs to this job (the transition INTO this screen), no
+   // matter how many frames the job ends up emitting.
+   const click = takeClickMeta(trigger);
++  if (trigger === 'load') activeLoadJob = { group, click, gen };
+   grabLoadingFrame(group, trigger, click, gen);
+   grabUiFrame(group, trigger, click, gen);
+   if (trigger === 'force' || trigger === 'interaction') {
+@@ -1135,7 +1223,7 @@ function runSnapJob(job) {
+         if (gen === snapGen) {
+           snapBusy = false;
+           if (snapQueue.length) runSnapJob(snapQueue.shift());
+-          else if (pendingStop) teardownRrweb();
++          else if (pendingStop) finishStop();
+           else if (captureSession) ensureRrweb();
+         }
+       }
+@@ -1176,11 +1264,12 @@ function runSnapJob(job) {
+             state: trigger === 'ui' ? 'ui' : 'loaded',
+           });
+         } finally {
++          if (activeLoadJob && activeLoadJob.group === group) activeLoadJob = null;
+           stopWalkCapture();
+           if (gen === snapGen) {
+             snapBusy = false;
+             if (snapQueue.length) runSnapJob(snapQueue.shift());
+-            else if (pendingStop) teardownRrweb();
++            else if (pendingStop) finishStop();
+             else if (captureSession) ensureRrweb();
+           }
+         }
+@@ -1201,7 +1290,7 @@ function runSnapJob(job) {
+       if (gen !== snapGen) return;
+       // Building a frame is cheap next to the wait itself; UI-state jobs
+       // (menu opened) have no loading phase worth keeping.
+-      const early = trigger === 'ui' ? null : buildFrame();
++      const early = trigger === 'ui' || !wantLoading ? null : buildFrame();
+       if (early) {
+         try {
+           ipcRenderer.sendToHost('ds-snap-early', { group });
+@@ -1218,7 +1307,7 @@ function runSnapJob(job) {
+     },
+     earlyMin,
+     earlyMax,
+-    { requireNoLoading: false, quietMs: EARLY_QUIET_MS, hardMax: true, acceptDropdown: trigger === 'click' || trigger === 'ui' }
++    { requireNoLoading: false, quietMs: EARLY_QUIET_MS, acceptDropdown: trigger === 'click' || trigger === 'ui' }
+   );
+ }
+ 
+@@ -2241,6 +2330,7 @@ function syntheticListbox(sel) {
+ 
+ function onMouseDown(e) {
+   if (!snapping) return;
++  if (e.isTrusted) finishLoadNow();
+   hoverTarget = e.target && e.target.nodeType === 1 ? e.target : null;
+ }
+ 
+@@ -2726,11 +2816,23 @@ function pageUrlKey(href) {
+   return documentUrlKey(href);
+ }
+ 
++// How long after a click a URL change still counts as that click's doing.
++const URL_AFTER_CLICK_MS = 2500;
++
+ function maybeLoadForUrlChange() {
+   if (!captureSession) return false;
+   const next = pageUrlKey(location.href);
+   if (!next || next === lastPageUrlKey) return false;
++  const prev = lastPageUrlKey;
+   lastPageUrlKey = next;
++  // The page wrote its own first step, nobody clicked: still the page being
++  // captured, not a new screen (an in-flight capture keeps going under the
++  // new key and saves the URL with the step).
++  if (screenParamsFilledIn(prev, location.href) && Date.now() - lastClickTs > URL_AFTER_CLICK_MS) {
++    if (activeSnapDocKey === prev) activeSnapDocKey = next;
++    if (loadingSentPath === prev) loadingSentPath = next;
++    return false;
++  }
+   loadingSentPath = '';
+   scheduleLoadSnapshot();
+   return true;
+@@ -2743,7 +2845,7 @@ function watchUrlAfterClick() {
+     navFallbackTimer = null;
+     if (!captureSession) return;
+     if (maybeLoadForUrlChange()) return;
+-    if (Date.now() - started < 2500) navFallbackTimer = setTimeout(tick, 80);
++    if (Date.now() - started < URL_AFTER_CLICK_MS) navFallbackTimer = setTimeout(tick, 80);
+   };
+   navFallbackTimer = setTimeout(tick, 80);
+ }
+@@ -2869,8 +2971,19 @@ function stopRecording() {
+     pendingStop = true;
+     return;
+   }
++  finishStop();
++}
++
++// Last events flushed, nothing left running: the host saves on this instead
++// of sitting out a fixed grace after Stop.
++function finishStop() {
+   showCaptureOverlay(false);
+   teardownRrweb();
++  try {
++    ipcRenderer.sendToHost('ds-stopped');
++  } catch {
++    /* host gone */
++  }
+ }
+ 
+ ipcRenderer.on('ds-start', startRecording);
+diff --git a/renderer/app.js b/renderer/app.js
+index 194b394..ddaabfb 100644
+--- a/renderer/app.js
++++ b/renderer/app.js
+@@ -451,6 +451,7 @@ async function initWebview() {
+     checkPageBlocked();
+   });
+   el.webview.addEventListener('did-navigate', (e) => {
++    noteUrlChange('desktop', e.url);
+     if (followLoadFailed('desktop', e)) return;
+     if (e.httpResponseCode > 0 && e.httpResponseCode < 400) failedFollowUrls.delete(e.url);
+     if (e.url && e.url !== 'about:blank') {
+@@ -468,6 +469,7 @@ async function initWebview() {
+   });
+   el.webview.addEventListener('did-navigate-in-page', (e) => {
+     if (e.isMainFrame === false) return;
++    noteUrlChange('desktop', e.url);
+     if (consumeRevertNav('desktop')) {
+       onNavigated(e.url);
+       return;
+@@ -542,18 +544,93 @@ function isRecordableUrl(url) {
+   return !!url && url !== 'about:blank';
+ }
+ 
+-function rawDocKey(url) {
++// --- Screen params ------------------------------------------------------------
++// The page key leaves the query out on purpose: a modal (Uber's
++// ?mod=quickView), a filter or a tracking tag is still the same screen, so
++// opening one never adds a card. Some query params *are* the route, though.
++// DoorDash's onboarding keeps every step on one path and moves ?step=welcome
++// → ?step=menu → ?step=choose-package. With the whole query dropped those were
++// all one page: no step became a screen, the phone was never moved to the
++// desktop's step, and Send link greyed out. A screen param's value is part of
++// the page key — a new value is a new screen, on both sides. The step family
++// is on by default; the recording panel adds any other param (or drops a
++// default) for the current recording only.
++// Keep paramWords … screenParamPairs in sync with guest-preload.js.
++const SCREEN_PARAM_WORDS = ['step', 'stage', 'phase'];
++const NO_SCREEN_PARAMS = { add: [], drop: [], off: true };
++let screenParamRules = { add: [], drop: [] };
++
++function paramWords(name) {
++  return String(name || '')
++    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
++    .toLowerCase()
++    .split(/[^a-z0-9]+/)
++    .filter(Boolean);
++}
++
++// step, stage, phase and names built on them (currentStep, onboarding_step,
++// step_id, wizard-stage), plus a bare "screen".
++function isDefaultScreenParam(name) {
++  const words = paramWords(name);
++  if (words.length === 1 && words[0] === 'screen') return true;
++  return words.length > 0 && words.length <= 3 && words.some((w) => SCREEN_PARAM_WORDS.includes(w));
++}
++
++function screenParamOn(name, rules = screenParamRules) {
++  const key = String(name || '').toLowerCase();
++  if (!key || rules.off || rules.drop.includes(key)) return false;
++  return rules.add.includes(key) || isDefaultScreenParam(name);
++}
++
++// ["step=menu"] — the screen params of a query string, sorted.
++function screenParamPairs(search, rules = screenParamRules) {
++  const pairs = [];
++  const seen = new Set();
++  for (const [k, v] of new URLSearchParams(search || '')) {
++    if (!v || seen.has(k) || !screenParamOn(k, rules)) continue;
++    seen.add(k);
++    pairs.push(`${k}=${v}`);
++  }
++  return pairs.sort();
++}
++
++function rawDocKey(url, rules = screenParamRules) {
+   try {
+     const u = new URL(url);
+     const path = u.pathname.replace(/\/+$/, '') || '/';
+     const rawHash = u.hash || '';
+-    const route = /^#\/+/.test(rawHash) || rawHash.startsWith('#!/') ? rawHash.split('?')[0] : '';
+-    return `${u.origin}${path}${route}`;
++    const hashRoute = /^#\/+/.test(rawHash) || rawHash.startsWith('#!/');
++    const [route, ...routeQuery] = hashRoute ? rawHash.split('?') : [''];
++    const query = screenParamPairs(u.search, rules);
++    const routeParams = screenParamPairs(routeQuery.join('?'), rules);
++    return `${u.origin}${path}${query.length ? `?${query.join('&')}` : ''}${route}${routeParams.length ? `?${routeParams.join('&')}` : ''}`;
+   } catch {
+     return String(url || '');
+   }
+ }
+ 
++// The page itself, whatever step it is on.
++function pageBaseKey(url) {
++  return rawDocKey(url, NO_SCREEN_PARAMS);
++}
++
++// Same page, another step: only the screen params differ.
++function otherStepOfSamePage(a, b) {
++  return !!a && !!b && pageBaseKey(a) === pageBaseKey(b) && rawDocKey(a) !== rawDocKey(b);
++}
++
++// "step=menu" for a card's meta line — which step of the page this screen is.
++function screenParamsLabel(url) {
++  try {
++    const u = new URL(url);
++    const hash = u.hash || '';
++    const routeQuery = /^#\/+/.test(hash) || hash.startsWith('#!/') ? hash.split('?').slice(1).join('?') : '';
++    return [...screenParamPairs(u.search), ...screenParamPairs(routeQuery)].join(' · ');
++  } catch {
++    return '';
++  }
++}
++
+ // Phone-only route → the desktop page showing the same state, learned from a
+ // click mirrored across split view. Sites route the two layouts differently
+ // (Uber: phone /store/<id>/<section>/<sub>/<item>, desktop /store/<id>?mod=
+@@ -746,21 +823,31 @@ function recWantsAutoScroll() {
+   return !!recAutoScroll;
+ }
+ 
++// Goes with every message that can arm a guest page, so both sides key pages
++// exactly as the host does.
++function guestScreenParams() {
++  return { add: screenParamRules.add.slice(), drop: screenParamRules.drop.slice() };
++}
++
++// Loading frames (the page still filling in) are captured only when a screen
++// is marked Loading — nothing else uses them, and every page paid for one.
+ function desktopGuestDocOpts() {
+   return {
+-    recordLoading: !isRerecordSession() || recWantsLoadingNow(),
++    recordLoading: recWantsLoadingNow(),
+     // Full-page walk only when Auto scroll is on — otherwise keep the
+     // page still under the cursor and capture the current viewport.
+     warm: recWantsAutoScroll() && wantsDesktopCapture(),
++    screenParams: guestScreenParams(),
+   };
+ }
+ 
+ function mobileGuestDocOpts() {
+   const primary = isMobilePrimaryCapture();
+   return {
+-    recordLoading: !isRerecordSession() || recWantsLoadingNow(),
++    recordLoading: recWantsLoadingNow(),
+     twin: !primary,
+     warm: recWantsAutoScroll(),
++    screenParams: guestScreenParams(),
+   };
+ }
+ 
+@@ -821,6 +908,7 @@ async function initMobileTwin(preloadPath) {
+     }
+   });
+   wv.addEventListener('did-navigate', (e) => {
++    noteUrlChange('mobile', e.url);
+     if (browseSidesManual() && urlTarget === 'mobile') {
+       syncUrlbar({ keepTyping: true });
+       updateNav();
+@@ -839,6 +927,7 @@ async function initMobileTwin(preloadPath) {
+   });
+   wv.addEventListener('did-navigate-in-page', (e) => {
+     if (e.isMainFrame === false) return;
++    noteUrlChange('mobile', e.url);
+     if (browseSidesManual() && urlTarget === 'mobile') {
+       syncUrlbar({ keepTyping: true });
+       updateNav();
+@@ -982,7 +1071,7 @@ function sendTwinJobSnap(wv, warm) {
+   state.mobileTwinReqAt = Date.now();
+   // The walk asking for this page's phone — wait for it to finish painting.
+   // Only a viewport freeze (Record as new screen / refresh) wants it as-is.
+-  wv.send('ds-snap', { as: 'screen', warm, req, settle: !viewportFreeze });
++  wv.send('ds-snap', { as: 'screen', warm, req, settle: !viewportFreeze, screenParams: guestScreenParams() });
+ }
+ 
+ // "Exactly what is on screen now" — Record as new screen. A twin job's snap
+@@ -1847,7 +1936,7 @@ async function waitForForcedMobile(take) {
+       asked = true;
+       twinLog('phone has not answered Record as new screen; asking again', take.req);
+       try {
+-        el.webviewMobile.send('ds-snap', { as: 'screen', warm: false, req: take.req });
++        el.webviewMobile.send('ds-snap', { as: 'screen', warm: false, req: take.req, screenParams: guestScreenParams() });
+       } catch {
+         /* guest gone */
+       }
+@@ -2596,10 +2685,11 @@ function forceRecordViewport(as, opts = {}) {
+       as: as === 'interaction' ? 'interaction' : 'screen',
+       warm,
+       req,
++      screenParams: guestScreenParams(),
+     });
+     if (wantsMobileTwin() && el.webviewMobile && wv !== el.webviewMobile) {
+       try {
+-        el.webviewMobile.send('ds-snap', { as: 'screen', warm, req });
++        el.webviewMobile.send('ds-snap', { as: 'screen', warm, req, screenParams: guestScreenParams() });
+       } catch {
+         /* twin not ready */
+       }
+@@ -2721,7 +2811,7 @@ function startCardRetake(idx, scope, mode, { settle = false } = {}) {
+   freezeTwinViewport(CARD_RETAKE_MAX_MS);
+   // Full page walks the page; viewport is what's on screen now — unless we
+   // just opened the page, then let it finish painting first.
+-  const opts = { as: 'screen', warm: mode === 'full', settle: mode !== 'full' && settle, req };
++  const opts = { as: 'screen', warm: mode === 'full', settle: mode !== 'full' && settle, req, screenParams: guestScreenParams() };
+   if (wantDesk) {
+     try {
+       el.webview.send('ds-snap', opts);
+@@ -3280,7 +3370,7 @@ function walkDesktopOnce(url) {
+   pageWalked[key] = true;
+   state.foldWarmForce = key;
+   try {
+-    el.webview?.send('ds-snap', { as: 'screen', warm: true });
++    el.webview?.send('ds-snap', { as: 'screen', warm: true, screenParams: guestScreenParams() });
+   } catch {
+     /* guest not ready */
+   }
+@@ -3368,6 +3458,12 @@ function setRecAutoScroll(on) {
+     btn.classList.toggle('on', recAutoScroll);
+     btn.setAttribute('aria-checked', String(recAutoScroll));
+   }
++  pushGuestDocOpts();
++}
++
++// The live pages pick up a change of capture options (Full page, a screen
++// marked Loading) without waiting for their next document.
++function pushGuestDocOpts() {
+   if (!state.recording) return;
+   try {
+     el.webview?.send('ds-opts', desktopGuestDocOpts());
+@@ -4779,6 +4875,307 @@ function syncRecProgressTimer() {
+   stopRecProgressTimer();
+ }
+ 
++// --- URL changes (recording panel) -------------------------------------------
++// What each side's URL did during this recording and whether it made a new
++// screen, so the two sides can be compared and a param that stayed "same
++// screen" (a tab, a view) can be made to count — for this recording only; the
++// next recording starts from the defaults again. Read off the navigation
++// events the walk already gets: nothing here waits on the page.
++const URL_LOG_MAX = 60;
++const URL_LOG_CHANGES_SHOWN = 3;
++let urlLog = []; // { side, at, url, page, changes: [{ k, from, to }], screen }
++const urlLogLast = { desktop: '', mobile: '' };
++let urlPanelFrame = 0;
++
++function resetUrlPanel() {
++  urlLog = [];
++  urlLogLast.desktop = webviewUrlOrAttr(el.webview);
++  urlLogLast.mobile = webviewUrlOrAttr(el.webviewMobile);
++  renderUrlPanel();
++}
++
++function queryChanges(fromUrl, toUrl) {
++  let a;
++  let b;
++  try {
++    a = new URL(fromUrl).searchParams;
++    b = new URL(toUrl).searchParams;
++  } catch {
++    return [];
++  }
++  const out = [];
++  for (const k of new Set([...a.keys(), ...b.keys()])) {
++    if (a.get(k) !== b.get(k)) out.push({ k, from: a.get(k), to: b.get(k) });
++  }
++  return out;
++}
++
++// Same window as the guest's: a URL change this soon after a click on that
++// side is the click's doing.
++const URL_AFTER_CLICK_MS = 2500;
++const lastBrowseClickAt = { desktop: 0, mobile: 0 };
++
++function noteUrlChange(side, url) {
++  if (!state.recording || !isRecordableUrl(url)) return;
++  const prev = urlLogLast[side];
++  urlLogLast[side] = url;
++  if (!isRecordableUrl(prev) || prev === url) return;
++  const page = pageBaseKey(prev) !== pageBaseKey(url);
++  const changes = queryChanges(prev, url);
++  if (!page && !changes.length) return; // an anchor (#section) — nothing moved
++  // The page wrote its own first step, nobody clicked (landing on /onboarding
++  // → ?step=welcome): the guest keeps that as the page it is capturing.
++  const filledIn = !page && !rawDocKey(prev).includes('?') && Date.now() - lastBrowseClickAt[side] > URL_AFTER_CLICK_MS;
++  urlLog.push({ side, at: Date.now(), url, page, changes, screen: !filledIn && rawDocKey(prev) !== rawDocKey(url) });
++  if (urlLog.length > URL_LOG_MAX) urlLog.splice(0, urlLog.length - URL_LOG_MAX);
++  scheduleUrlPanel();
++}
++
++function scheduleUrlPanel() {
++  if (urlPanelFrame) return;
++  urlPanelFrame = requestAnimationFrame(() => {
++    urlPanelFrame = 0;
++    renderUrlPanel();
++  });
++}
++
++// Every param that makes a new screen right now and is worth showing: the
++// defaults, the ones this walk's URLs carry, and the ones added by hand.
++function shownScreenParams() {
++  const names = new Map();
++  const offer = (n) => {
++    if (n && !names.has(n.toLowerCase())) names.set(n.toLowerCase(), n);
++  };
++  ['step', 'stage', 'phase', 'screen'].forEach(offer);
++  for (const url of [urlLogLast.desktop, urlLogLast.mobile]) {
++    try {
++      for (const k of new URL(url).searchParams.keys()) offer(k);
++    } catch {
++      /* no page yet */
++    }
++  }
++  for (const e of urlLog) e.changes.forEach((c) => offer(c.k));
++  screenParamRules.add.forEach(offer);
++  return [...names.values()].filter((n) => screenParamOn(n));
++}
++
++function setScreenParam(name, on) {
++  const raw = String(name || '').trim().replace(/^[?&]+|=+$/g, '');
++  const key = raw.toLowerCase();
++  if (!key || key.length > 64 || /[\s&=?#]/.test(key)) {
++    toast('That is not a URL param name');
++    renderUrlPanel();
++    return;
++  }
++  const add = screenParamRules.add.filter((p) => p !== key);
++  const drop = screenParamRules.drop.filter((p) => p !== key);
++  if (on && !isDefaultScreenParam(raw)) add.push(key);
++  if (!on) drop.push(key);
++  applyScreenParamRules({ add, drop });
++  const undo = { label: 'Undo', onClick: () => setScreenParam(raw, !on) };
++  if (!on) {
++    toast(`?${raw}= stays on the same screen in this recording`, undo);
++    return;
++  }
++  // Added while the page already shows a value of it (the tab just opened):
++  // that view is a screen of its own now, so save it right away.
++  const wv = activeBrowseWebview();
++  const url = webviewUrlOrAttr(wv);
++  let has = false;
++  try {
++    has = [...new URL(url).searchParams].some(([k, v]) => k.toLowerCase() === key && !!v);
++  } catch {
++    has = false;
++  }
++  if (state.recording && state.accepting && has && !pageAlreadyRecording(url)) {
++    forceRecordViewport('screen');
++    toast(`Each ?${raw}= is a new screen in this recording — saving this one`, undo);
++    return;
++  }
++  toast(`Each ?${raw}= is a new screen in this recording`, undo);
++}
++
++function applyScreenParamRules(next) {
++  screenParamRules = { add: [...new Set(next.add)], drop: [...new Set(next.drop)] };
++  // Phone frames waiting for their screen are filed under the page key, and
++  // page keys just changed.
++  const pending = state.pendingMobile || {};
++  state.pendingMobile = {};
++  for (const p of Object.values(pending)) if (p && p.url) state.pendingMobile[urlDocKey(p.url)] = p;
++  const opts = { screenParams: guestScreenParams() };
++  for (const wv of [el.webview, el.webviewMobile]) {
++    try {
++      wv?.send('ds-opts', opts);
++    } catch {
++      /* guest not ready */
++    }
++  }
++  renderUrlPanel();
++  renderRecScreens();
++}
++
++function screenOfUrl(url) {
++  for (let i = state.screens.length - 1; i >= 0; i--) {
++    const s = state.screens[i];
++    if (s && s.kind !== 'image' && sameTwinDoc(s.url, url)) return i;
++  }
++  return -1;
++}
++
++function urlChangeLine(e) {
++  const line = document.createElement('div');
++  line.className = 'rec-url-what';
++  if (e.page) {
++    let where = e.url;
++    try {
++      const u = new URL(e.url);
++      where = `${u.pathname}${u.hash && /^#!?\//.test(u.hash) ? u.hash.split('?')[0] : ''}`;
++    } catch {
++      /* keep the raw URL */
++    }
++    line.textContent = `→ ${where}`;
++    line.title = e.url;
++    return line;
++  }
++  e.changes.slice(0, URL_LOG_CHANGES_SHOWN).forEach((c) => {
++    const part = document.createElement('span');
++    part.className = 'rec-url-change';
++    const k = document.createElement('code');
++    k.className = `rec-url-param${screenParamOn(c.k) ? ' is-on' : ''}`;
++    k.textContent = c.k;
++    const v = document.createElement('span');
++    v.textContent = ` ${c.from ?? '—'} → ${c.to ?? '—'}`;
++    part.append(k, v);
++    line.appendChild(part);
++  });
++  if (e.changes.length > URL_LOG_CHANGES_SHOWN) {
++    const more = document.createElement('span');
++    more.className = 'rec-url-more';
++    more.textContent = `+${e.changes.length - URL_LOG_CHANGES_SHOWN}`;
++    line.appendChild(more);
++  }
++  line.title = e.url;
++  return line;
++}
++
++function renderUrlPanel() {
++  const box = $('rec-urls');
++  if (!box) return;
++  const count = $('rec-urls-count');
++  const latest = $('rec-urls-latest');
++  const last = urlLog[urlLog.length - 1];
++  if (count) count.textContent = urlLog.length ? String(urlLog.length) : '';
++  if (latest) {
++    latest.textContent = last
++      ? last.page
++        ? urlChangeLine(last).textContent
++        : last.changes.map((c) => `${c.k}: ${c.to ?? '—'}`).join(' · ')
++      : '';
++  }
++
++  const params = $('rec-params');
++  // A param name being typed survives URL changes landing meanwhile.
++  if (params && !params.querySelector('.rec-param-input')) {
++    params.innerHTML = '';
++    const label = document.createElement('div');
++    label.className = 'rec-params-label';
++    label.textContent = 'New screen when these change';
++    const chips = document.createElement('div');
++    chips.className = 'rec-params-chips';
++    for (const name of shownScreenParams()) {
++      const chip = document.createElement('span');
++      chip.className = 'rec-param-chip';
++      const text = document.createElement('code');
++      text.textContent = name;
++      const off = document.createElement('button');
++      off.type = 'button';
++      off.className = 'rec-param-off';
++      off.title = `Keep ?${name}= on the same screen (this recording only)`;
++      off.setAttribute('aria-label', `Stop making new screens for ${name}`);
++      off.textContent = '×';
++      off.onclick = () => setScreenParam(name, false);
++      chip.append(text, off);
++      chips.appendChild(chip);
++    }
++    const addBtn = document.createElement('button');
++    addBtn.type = 'button';
++    addBtn.className = 'rec-param-add';
++    addBtn.title = 'Make another URL param a new screen (this recording only)';
++    addBtn.setAttribute('aria-label', 'Add a URL param');
++    addBtn.textContent = '+';
++    addBtn.onclick = () => {
++      const input = document.createElement('input');
++      input.className = 'rec-param-input mono';
++      input.placeholder = 'param';
++      input.setAttribute('aria-label', 'URL param that makes a new screen');
++      input.spellcheck = false;
++      let done = false;
++      const finish = (commit) => {
++        if (done) return;
++        done = true;
++        const value = input.value.trim();
++        input.remove();
++        if (commit && value) setScreenParam(value, true);
++        else renderUrlPanel();
++      };
++      input.onkeydown = (ev) => {
++        if (ev.key === 'Enter') finish(true);
++        if (ev.key === 'Escape') finish(false);
++      };
++      input.onblur = () => finish(true);
++      addBtn.replaceWith(input);
++      input.focus();
++    };
++    chips.appendChild(addBtn);
++    params.append(label, chips);
++  }
++
++  const list = $('rec-url-log');
++  if (!list) return;
++  list.innerHTML = '';
++  if (!urlLog.length) {
++    const empty = document.createElement('div');
++    empty.className = 'rec-url-empty';
++    empty.textContent = 'URL changes on either side show up here.';
++    list.appendChild(empty);
++    return;
++  }
++  for (let i = urlLog.length - 1; i >= 0; i--) {
++    const e = urlLog[i];
++    const row = document.createElement('div');
++    row.className = `rec-url-row ${e.screen ? 'is-screen' : 'is-same'}`;
++    const side = document.createElement('span');
++    side.className = 'rec-url-side';
++    side.title = e.side === 'mobile' ? 'Mobile' : 'Desktop';
++    side.innerHTML = deviceIconHtml(e.side);
++    const main = document.createElement('div');
++    main.className = 'rec-url-main';
++    const meta = document.createElement('div');
++    meta.className = 'rec-url-meta';
++    const idx = e.screen ? screenOfUrl(e.url) : -1;
++    const time = document.createElement('span');
++    time.className = 'mono';
++    time.textContent = fmtTimer(Math.max(0, e.at - (state.startedAt || e.at)));
++    const outcome = document.createElement('span');
++    outcome.textContent = idx >= 0 ? screenLabel(state.screens[idx], idx) : e.screen ? 'New screen' : 'Same screen';
++    meta.append(time, outcome);
++    if (!e.page) {
++      for (const c of e.changes.filter((ch) => !screenParamOn(ch.k)).slice(0, 2)) {
++        const add = document.createElement('button');
++        add.type = 'button';
++        add.className = 'rec-url-add';
++        add.title = `Make each ?${c.k}= a new screen (this recording only)`;
++        add.textContent = `+ ${c.k}`;
++        add.onclick = () => setScreenParam(c.k, true);
++        meta.appendChild(add);
++      }
++    }
++    main.append(urlChangeLine(e), meta);
++    row.append(side, main);
++    list.appendChild(row);
++  }
++}
++
+ function renderRecScreens() {
+   const list = $('rec-screens');
+   if (!list) return;
+@@ -4928,7 +5325,7 @@ function renderRecScreens() {
+           ? `Back to screen ${it.screen + 1}`
+           : it.status === 'skipped'
+             ? 'Skipped — recording is full'
+-            : hostnameOf(it.url) + (s && s.url ? pathOf(s.url) : '');
++            : hostnameOf(it.url) + (s && s.url ? pathOf(s.url) + (screenParamsLabel(s.url) ? ` · ${screenParamsLabel(s.url)}` : '') : '');
+     const prog = document.createElement('div');
+     prog.className = 'rec-screen-progress';
+     const bar = document.createElement('div');
+@@ -5170,6 +5567,7 @@ function setRecItemLoading(it, on) {
+   }
+   if (state.loadingByGroup && it.group) delete state.loadingByGroup[it.group];
+   state.retakeLoading = null;
++  pushGuestDocOpts();
+   renderRecScreens();
+ }
+ 
+@@ -5446,6 +5844,13 @@ function followOtherWebviewNow(source, url) {
+   if (!other || !isRecordableUrl(url)) return;
+   const current = webviewUrlOrAttr(other);
+   if (current && sameTwinDoc(current, url)) return;
++  // The phone is taking another screen's mobile frame: moving it now throws
++  // that capture away and the walk waits for it again. Its capture queue
++  // brings the phone on to the desktop's page next.
++  if (other === el.webviewMobile && state.mobileTwinCapturing && state.mobileTwinCurrent && !sameTwinDoc(state.mobileTwinCurrent, url)) {
++    twinLog('follow: phone is capturing', state.mobileTwinCurrent, '— it comes after');
++    return;
++  }
+   // ensurePhoneOnScreen may have just pointed it here.
+   const pending = other.getAttribute?.('src') || '';
+   if (pending && pending === url) return;
+@@ -5703,6 +6108,7 @@ function keepBrowseFocus(source) {
+ }
+ 
+ function mirrorBrowseClick(source, click) {
++  if (click) lastBrowseClickAt[source] = Date.now();
+   if (!splitBrowseSync() || !click) return;
+   // Our own replayed click reporting back from the side we clicked.
+   if (Date.now() < mirrorEchoUntil[source]) return;
+@@ -5756,11 +6162,42 @@ function mirrorBrowseClick(source, click) {
+     .finally(() => {
+       tx.pending = false;
+       if (browseMirror !== tx) return;
+-      if (tx.matched) learnFromMirror(tx);
+-      else if (tx.followUrl) followOtherWebviewNow(source, tx.followUrl);
++      if (tx.matched) {
++        learnFromMirror(tx);
++        settleMirroredStep(tx);
++      } else if (tx.followUrl) followOtherWebviewNow(source, tx.followUrl);
+     });
+ }
+ 
++// A mirrored click can land and still do nothing (it hit the matched
++// element's container, or the other layout wires that control differently).
++// When the source then moved to another step of the same page and the other
++// side never navigated, it is a step behind — follow the source's URL.
++// Limited to steps of one page: a side that stayed on a *different* page may
++// be showing the same state its own way (Uber's phone sheets), and is left
++// alone as before.
++const MIRROR_SETTLE_MS = 1200;
++
++function settleMirroredStep(tx) {
++  const other = tx.source === 'desktop' ? 'mobile' : 'desktop';
++  const sourceWv = tx.source === 'desktop' ? el.webview : el.webviewMobile;
++  const otherWv = other === 'desktop' ? el.webview : el.webviewMobile;
++  const check = () => {
++    if (browseMirror !== tx || !splitBrowseSync() || browseFollowLock || viewportFreeze) return;
++    if (Date.now() - tx.at < MIRROR_SETTLE_MS || isLoadingMainFrame(sourceWv) || isLoadingMainFrame(otherWv)) {
++      if (browseMirrorFresh(tx)) setTimeout(check, 200);
++      return;
++    }
++    if (tx.nav[other] || (lastBrowseNav[other] && lastBrowseNav[other].at >= tx.at)) return;
++    const from = webviewUrlOrAttr(sourceWv);
++    const to = webviewUrlOrAttr(otherWv);
++    if (!isRecordableUrl(from) || !isRecordableUrl(to) || sameTwinDoc(from, to) || !otherStepOfSamePage(from, to)) return;
++    twinLog('mirror: other side stayed on its step; following', tx.source, from);
++    followOtherWebviewNow(tx.source, from);
++  };
++  setTimeout(check, MIRROR_SETTLE_MS);
++}
++
+ // Toolbar back/forward/reload act on both sides in split view.
+ function browseHistory(dir) {
+   const both = splitBrowseSync() && !isMobilePrimaryCapture();
+@@ -6525,6 +6962,10 @@ function startRecording() {
+   if (state.recording || !state.pageLoaded || state.mode !== 'browser') return;
+   state.recording = true;
+   state.accepting = true;
++  // Params added or dropped in the URL changes panel were for the last
++  // recording; every recording starts from the defaults (ds-start below
++  // carries them to the guests).
++  screenParamRules = { add: [], drop: [] };
+   state.recordIntoId = webProjectId();
+   state.recordFromScreenIdx =
+     state.rerecordSavedIdx >= 0
+@@ -6574,7 +7015,7 @@ function startRecording() {
+     const wv = el.webviewMobile;
+     if (wv) {
+       try {
+-        wv.send('ds-start', { recordLoading: recWantsLoadingNow(), twin: false, warm: recWantsAutoScroll() });
++        wv.send('ds-start', { recordLoading: recWantsLoadingNow(), twin: false, warm: recWantsAutoScroll(), screenParams: guestScreenParams() });
+       } catch {
+         /* ignore */
+       }
+@@ -6598,6 +7039,7 @@ function startRecording() {
+   el.recLive.hidden = false;
+   setInspectorCollapsed(false);
+   renderRecScreens();
++  resetUrlPanel();
+   if (el.sessionName && !el.sessionName.value) el.sessionName.value = state.currentTitle || hostnameOf(state.currentUrl) || 'Recording';
+   el.toolbarTimer.querySelector('.rec-dot').classList.add('pulsing');
+   announce(state.recordIntoId ? 'Recording — adding to this project' : 'Recording started');
+@@ -6724,9 +7166,35 @@ function updateTimer() {
+   state.eventsSinceTick = 0;
+ }
+ 
+-// Grace after Stop: final rrweb chunks and queued click snapshots (~6s settle).
++// After Stop the save waits for the page to report its last events are in
++// (ds-stopped) — usually well under a second. This is only the ceiling, for a
++// page that never answers (it was mid-navigation, or crashed).
+ const SAVE_GRACE_MS = 8000;
+ 
++function guestStoppedOrGrace(wv, ms) {
++  return new Promise((resolve) => {
++    let timer = 0;
++    const onMessage = (e) => {
++      if (e.channel === 'ds-stopped') done();
++    };
++    const done = () => {
++      clearTimeout(timer);
++      try {
++        wv?.removeEventListener('ipc-message', onMessage);
++      } catch {
++        /* guest gone */
++      }
++      resolve();
++    };
++    timer = setTimeout(done, ms);
++    try {
++      wv?.addEventListener('ipc-message', onMessage);
++    } catch {
++      /* guest gone: the timer saves */
++    }
++  });
++}
++
+ // Stop only after every project screen has mobileHtml, no admit is in flight,
+ // and every deferred desktop take from the walk has been admitted with mobile.
+ // If Stop was clicked during an admit, drain pending then stop.
+@@ -6806,6 +7274,7 @@ function stopRecording(reason) {
+   setSaveOverlayFrac(0.2, 'Saving recording…', SAVE_GRACE_MS);
+ 
+   // Desktop stops immediately. Twin does no work after Stop — mobile already landed.
++  const guestStopped = guestStoppedOrGrace(isMobilePrimaryCapture() ? el.webviewMobile : el.webview, SAVE_GRACE_MS);
+   try {
+     if (isMobilePrimaryCapture()) {
+       el.webviewMobile?.send('ds-stop');
+@@ -6823,7 +7292,7 @@ function stopRecording(reason) {
+     stopMobileTwin();
+     state.mobileTwinArmed = false;
+ 
+-    await waitMs(SAVE_GRACE_MS);
++    await guestStopped;
+     state.accepting = false;
+     try {
+       api.setRecordingState(false);
+@@ -7610,6 +8079,7 @@ function showPopupMenu(x, y, items) {
+       b.textContent = it.label;
+     }
+     b.style.cssText = `display:${it.lead ? 'flex' : 'block'};align-items:center;gap:10px;width:100%;text-align:left;padding:6px 10px;border-radius:6px;font-size:13px;color:${it.danger ? 'var(--accent-red)' : 'var(--text)'};`;
++    if (it.title) b.title = it.title;
+     if (it.disabled) {
+       b.disabled = true;
+       b.style.opacity = '0.4';
+@@ -22707,6 +23177,12 @@ function wireControls() {
+     const both = phoneBrowseLive() && !isMobilePrimaryCapture() && !!el.webviewMobile;
+     const deskUrl = webviewUrlOrAttr(el.webview);
+     const phoneUrl = webviewUrlOrAttr(el.webviewMobile);
++    // Send link is there whenever both sides are up and the source has a
++    // page. It used to grey out when the sides looked like "the same page",
++    // but that test reads the page key, which drops most of the query: the
++    // two sides of ?step=menu and ?step=choose-package looked alike and both
++    // items went dead exactly when they were needed. Sending the link a side
++    // is already on only reloads it there — a quick re-sync.
+     showPopupMenu(rect.left, rect.bottom + 4, [
+       { label: 'Hard reload', fn: () => hardReload() },
+       { label: 'Clear cache data', fn: () => clearCacheData() },
+@@ -22716,14 +23192,16 @@ function wireControls() {
+         label: 'Send the desktop link to mobile',
+         lead: sendLinkLead('desktop', 'mobile'),
+         leadOnly: true,
+-        disabled: !both || !isRecordableUrl(deskUrl) || sameTwinDoc(deskUrl, phoneUrl),
++        title: isRecordableUrl(deskUrl) ? deskUrl : '',
++        disabled: !both || !isRecordableUrl(deskUrl),
+         fn: () => pushLinkAcross('toMobile'),
+       },
+       {
+         label: 'Send the mobile link to desktop',
+         lead: sendLinkLead('mobile', 'desktop'),
+         leadOnly: true,
+-        disabled: !both || !isRecordableUrl(phoneUrl) || sameTwinDoc(deskUrl, phoneUrl),
++        title: isRecordableUrl(phoneUrl) ? phoneUrl : '',
++        disabled: !both || !isRecordableUrl(phoneUrl),
+         fn: () => pushLinkAcross('toDesktop'),
+       },
+     ]);
+@@ -22750,6 +23228,21 @@ function wireControls() {
+   $('ctl-rec-autoscroll')?.addEventListener('click', () => {
+     setRecAutoScroll(!recWantsAutoScroll());
+   });
++  const recUrls = $('rec-urls');
++  if (recUrls) {
++    try {
++      recUrls.open = localStorage.getItem('recUrlsOpen') === '1';
++    } catch {
++      /* storage unavailable: starts closed */
++    }
++    recUrls.addEventListener('toggle', () => {
++      try {
++        localStorage.setItem('recUrlsOpen', recUrls.open ? '1' : '0');
++      } catch {
++        /* storage unavailable */
++      }
++    });
++  }
+   const recordViewport = $('btn-record-viewport');
+   if (recordViewport) recordViewport.onclick = () => forceRecordViewport('screen');
+   const rerecordTarget = $('rec-rerecord-target');
+diff --git a/renderer/index.html b/renderer/index.html
+index 8fb7b57..831ce45 100644
+--- a/renderer/index.html
++++ b/renderer/index.html
+@@ -442,6 +442,16 @@
+                 </div>
+                 <div class="rec-counters" id="rec-counters">0 screens · 0 flows</div>
+                 <div class="rec-screens" id="rec-screens" aria-live="polite"></div>
++                <details class="rec-urls" id="rec-urls">
++                  <summary class="rec-urls-head" title="How the URL changed on each side, and which URL params make a new screen">
++                    <span class="overline">URL changes</span>
++                    <span class="rec-urls-count mono" id="rec-urls-count"></span>
++                    <span class="rec-urls-latest mono" id="rec-urls-latest"></span>
++                    <svg class="rec-urls-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
++                  </summary>
++                  <div class="rec-params" id="rec-params"></div>
++                  <div class="rec-url-log" id="rec-url-log"></div>
++                </details>
+                 <div class="rec-live-actions">
+                   <button type="button" class="ghost-pill primary full" id="btn-record-viewport" title="Adds a new screen of what’s on the live page now, without reloading. To recapture a take, use Refresh screen.">
+                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 8v8M8 12h8"/></svg>
+diff --git a/renderer/styles.css b/renderer/styles.css
+index e794018..afccad7 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -3674,6 +3674,191 @@ select.tl-aspect {
+   overflow: auto;
+   scrollbar-width: thin;
+ }
++/* URL changes: one line under the screen list until opened. */
++.rec-urls {
++  flex: 0 0 auto;
++  margin: 0 0 12px;
++  border: 1px solid var(--border);
++  border-radius: 10px;
++  background: var(--surface);
++}
++.rec-urls-head {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  min-width: 0;
++  padding: 8px 10px;
++  cursor: pointer;
++  list-style: none;
++}
++.rec-urls-head::-webkit-details-marker {
++  display: none;
++}
++.rec-urls-count {
++  font-size: 11px;
++  color: var(--text-muted);
++}
++.rec-urls-latest {
++  flex: 1 1 auto;
++  min-width: 0;
++  font-size: 11px;
++  color: var(--text-faint);
++  text-align: right;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++.rec-urls-chevron {
++  flex: none;
++  color: var(--text-faint);
++  transition: transform 0.15s var(--ease);
++}
++.rec-urls[open] .rec-urls-chevron {
++  transform: rotate(180deg);
++}
++.rec-params {
++  padding: 0 10px 8px;
++}
++.rec-params-label {
++  margin-bottom: 6px;
++  font-size: 11px;
++  color: var(--text-muted);
++}
++.rec-params-chips {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 4px;
++}
++.rec-param-chip {
++  display: inline-flex;
++  align-items: center;
++  gap: 2px;
++  height: 22px;
++  padding: 0 2px 0 8px;
++  border-radius: 999px;
++  background: rgba(94, 92, 230, 0.2);
++  font-size: 11px;
++}
++.rec-param-chip code,
++.rec-url-param {
++  font-family: var(--mono);
++  font-size: 11px;
++}
++.rec-param-off {
++  width: 18px;
++  height: 18px;
++  border-radius: 50%;
++  font-size: 13px;
++  line-height: 1;
++  color: var(--text-muted);
++}
++.rec-param-off:hover {
++  background: var(--surface-hover);
++  color: var(--text);
++}
++.rec-param-add {
++  min-width: 22px;
++  height: 22px;
++  padding: 0 7px;
++  border: 1px dashed var(--border-strong);
++  border-radius: 999px;
++  font-size: 13px;
++  line-height: 1;
++  color: var(--text-muted);
++}
++.rec-param-add:hover {
++  border-color: var(--text-faint);
++  color: var(--text);
++}
++.rec-param-input {
++  width: 96px;
++  height: 22px;
++  padding: 0 8px;
++  border: 1px solid var(--indigo);
++  border-radius: 999px;
++  background: var(--bg);
++  font-size: 11px;
++  outline: none;
++  user-select: text;
++}
++.rec-url-log {
++  max-height: 180px;
++  padding: 4px 0;
++  border-top: 1px solid var(--border);
++  overflow: auto;
++  scrollbar-width: thin;
++}
++.rec-url-empty {
++  padding: 8px 10px;
++  font-size: 11px;
++  color: var(--text-faint);
++}
++.rec-url-row {
++  display: flex;
++  align-items: flex-start;
++  gap: 8px;
++  padding: 6px 10px;
++}
++.rec-url-side {
++  flex: none;
++  width: 14px;
++  height: 14px;
++  margin-top: 1px;
++  color: var(--text-muted);
++}
++.rec-url-side svg {
++  display: block;
++  width: 14px;
++  height: 14px;
++}
++.rec-url-main {
++  flex: 1 1 auto;
++  min-width: 0;
++}
++.rec-url-what {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 2px 8px;
++  min-width: 0;
++  font-size: 12px;
++  word-break: break-all;
++}
++.rec-url-param {
++  color: var(--text-muted);
++}
++.rec-url-param.is-on {
++  color: #a5a4ff;
++}
++.rec-url-more {
++  font-size: 11px;
++  color: var(--text-faint);
++}
++.rec-url-meta {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 4px 8px;
++  margin-top: 2px;
++  font-size: 11px;
++  color: var(--text-faint);
++}
++.rec-url-row.is-screen .rec-url-meta > span:nth-child(2) {
++  color: var(--text-muted);
++}
++.rec-url-add {
++  height: 18px;
++  padding: 0 7px;
++  border: 1px solid var(--border-strong);
++  border-radius: 999px;
++  font-family: var(--mono);
++  font-size: 10px;
++  color: var(--text-muted);
++}
++.rec-url-add:hover {
++  background: var(--surface-hover);
++  color: var(--text);
++}
+ .rec-screens-empty {
+   font-size: 12px;
+   color: var(--text-faint);
+-- 
+2.43.0
+
