@@ -1,8 +1,11 @@
-# Step URLs, Send link and fast saving (for DOM Studio 1.0.17)
+# Step URLs, Send link, fast saving and landing line (for DOM Studio 1.0.17)
 
-`0001-record-step-wizards.patch` changes the app source. It was made against
-the 1.0.17 sources (`main.js`, `guest-preload.js`, `renderer/`) and applies
-cleanly to them with `git am`.
+Two patches to the app source. Both were made against the 1.0.17 sources
+(`main.js`, `guest-preload.js`, `renderer/`) and apply cleanly with `git am`:
+
+- `0001-record-step-wizards.patch`: step URLs, Send link and fast saving.
+- `0002-landing-copy.patch`: the new landing line with device icons. It
+  applies on its own or after 0001.
 
 ## What changes
 
@@ -47,6 +50,13 @@ whether it made a new screen.
 **Project rules.** `.claude/rules/recording.md` writes these rules down so
 later changes keep them. Claude Code loads the file automatically.
 
+**Landing line (`0002`).** The home screen's line under "Record the web as
+HTML" now reads: "Walk through any app once. DOM Studio captures every screen
+as real HTML — desktop, tablet and mobile together, flows and a tree you can
+rearrange, ready for Figma, Cursor or Claude." Desktop, tablet and mobile each
+carry the icon from the View as control, and an icon never wraps away from
+its word.
+
 ## Apply
 
 From the root of the DOM Studio source (the folder with `main.js`,
@@ -54,9 +64,11 @@ From the root of the DOM Studio source (the folder with `main.js`,
 
 ```sh
 git am /path/to/0001-record-step-wizards.patch
-# if the source has moved on since 1.0.17:
-git apply --3way /path/to/0001-record-step-wizards.patch
+git am /path/to/0002-landing-copy.patch
 ```
+
+If `git am` stops because the source has moved on since 1.0.17, run
+`git am --abort` and apply that patch again with `git am -3`.
 
 ## Check it on the real onboarding
 
