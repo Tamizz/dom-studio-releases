@@ -1,0 +1,676 @@
+From 06b29851973498c0b3879f9b5a196795e59d1806 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 20:18:02 +0000
+Subject: [PATCH] Number recorded screens, URL bar view buttons, Save screen
+ now
+
+Screens are numbered, and the right panel follows the flow strip:
+- Every card in the recording panel shows its number in the recording,
+  the same number as its card in the flow strip and in the preview (1, 2,
+  3; a loading card after screen 2 is 2.1). A page still saving shows the
+  number it is about to get.
+- The panel lists cards in the flow strip's order (state.screens), not
+  the order captures started in. A page whose save was held back (phone
+  still capturing, its row pointed at a newer frame) used to sit above a
+  screen saved before it.
+- A screen whose row was dropped while its take waited still gets a row,
+  so the panel never misses a screen the strip shows.
+
+The URL bar's view buttons change the stage:
+- Desktop + mobile, Desktop and Mobile are View as from the recording
+  panel: picking one switches the stage, and each follows the other. They
+  show in every view, not only side by side.
+- Manual sides stay for re-records whose desktop and phone links differ.
+
+Refresh screen is now Save screen now:
+- It saves the card exactly as both sides look at that moment, whatever
+  it was waiting on. Waiting on its phone: the phone is snapped as it is
+  (and the desktop again, if it is still on that page), instead of
+  sending the card back to "Saving..." behind the same wait. Held behind
+  an earlier card: that card is saved first, then this one. Still
+  settling: both sides are snapped now.
+- Later frames of the page (fills, reloads, a second load) don't write
+  over a screen saved this way.
+- The phone job the snap cancels is closed, so the next page doesn't
+  wait out the 45 s stall timer.
+- A row for a page the desktop has left, with nothing of it taken, is
+  dropped when the next document starts, instead of reading "Saving..."
+  forever. Save screen now on such a row says the page isn't open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nt7dnu8bKGPDYCAaeAVpPb
+---
+ renderer/app.js     | 355 ++++++++++++++++++++++++++++++++++++++++----
+ renderer/index.html |  10 +-
+ renderer/styles.css |  27 ++++
+ 3 files changed, 355 insertions(+), 37 deletions(-)
+
+diff --git a/renderer/app.js b/renderer/app.js
+index 288035d..91bb364 100644
+--- a/renderer/app.js
++++ b/renderer/app.js
+@@ -1088,12 +1088,12 @@ function isForcedTake(take) {
+ 
+ // Card saved without its phone frame: the phone never answered. The card stays
+ // usable (desktop-only, "mobile unavailable") instead of blocking the walk.
+-function giveUpMobile(take, why) {
++function giveUpMobile(take, why, msg) {
+   if (!take || take.mobileHtml) return;
+   take.noMobile = true;
+   take.mobileTimedOut = true;
+   twinLog('gave up on mobile', why, take.name || take.url);
+-  toast('Mobile didn’t respond — saved desktop only. Use “re-record mobile” on this card.');
++  toast(msg || 'Mobile didn’t respond — saved desktop only. Use “re-record mobile” on this card.');
+ }
+ 
+ function syncMobileTwin(url, { force = false } = {}) {
+@@ -1909,6 +1909,11 @@ async function waitForScreenMobileDuringWalk(take) {
+       twinLog('admit mobile landed', take.name || take.url, 'mobileHtml', (take.mobileHtml || '').length);
+       return;
+     }
++    // Save screen now gave up on a phone that wasn't showing this page.
++    if (take.noMobile) {
++      if (state.mobileTwinHoldIdx === ADMIT_TWIN_IDX) state.mobileTwinHoldIdx = -1;
++      return;
++    }
+     if (!state.recording) {
+       throw new Error('waitForScreenMobileDuringWalk: recording ended before mobile');
+     }
+@@ -2145,8 +2150,47 @@ function hasLoadingScreenForUrl(url) {
+ }
+ 
+ function recDisplayItems() {
+-  const rerecord = isRerecordSession();
+-  return (rerecord ? state.recItems : state.recItems.filter((it) => it.status !== 'linked' && it.status !== 'layer')).slice(-40);
++  if (isRerecordSession()) return state.recItems.slice(-40);
++  return recRowsInScreenOrder().slice(-40);
++}
++
++// The right panel lists the recording in the flow strip's order — one row per
++// screen, in state.screens order — and then the pages still saving. Rows used
++// to keep the order their captures started in, so a page whose save was held
++// back (phone still capturing, its row pointed at a newer frame of the page)
++// sat above a screen that was saved before it, and the two lists disagreed.
++function recRowsInScreenOrder() {
++  const byScreen = new Map();
++  const pending = [];
++  const skipped = new Map(); // screen index the row came after → rows
++  let after = -1;
++  for (const it of state.recItems) {
++    if (!it || it.status === 'linked' || it.status === 'layer') continue;
++    const idx = Number.isInteger(it.screen) ? it.screen : -1;
++    if (idx >= 0 && state.screens[idx]) {
++      const have = byScreen.get(idx);
++      // One row per screen; a retake in progress shows over the saved row.
++      if (!have || (it.status === 'settling' && have.status !== 'settling')) byScreen.set(idx, it);
++      after = Math.max(after, idx);
++    } else if (it.status === 'settling') {
++      pending.push(it);
++    } else {
++      if (!skipped.has(after)) skipped.set(after, []);
++      skipped.get(after).push(it);
++    }
++  }
++  const rows = [...(skipped.get(-1) || [])];
++  state.screens.forEach((s, i) => {
++    let row = byScreen.get(i);
++    if (!row && s && !isVideoStill(s)) {
++      // Every screen in the flow strip has its row here.
++      row = { group: s.group, status: 'captured', screen: i, label: s.name, url: s.url || '', ts: s.ts || Date.now(), rowSeen: true };
++      state.recItems.push(row);
++    }
++    if (row) rows.push(row);
++    if (skipped.has(i)) rows.push(...skipped.get(i));
++  });
++  return rows.concat(pending);
+ }
+ 
+ function rerecordTargetScreen() {
+@@ -2365,6 +2409,31 @@ function dropSettlingForDoc(url, keep) {
+   });
+ }
+ 
++// Is this row's take already in — waiting behind an earlier card, or on its
++// own phone? Then it saves whatever page the desktop is on now.
++function recRowTakeIsIn(it) {
++  if (!it) return false;
++  if (recRowAwaitingMobile(it)) return true;
++  if (state.admittingTake && sameTwinDoc(state.admittingTake.url, it.url)) return true;
++  return state.pendingDesktopTakes.some((t) => t && (t.group === it.group || sameTwinDoc(t.url, it.url)));
++}
++
++// The desktop opened another document: a row still saving a page it has left
++// lost its job with that page, and would read "Saving…" forever. Drop it —
++// unless its take is already in. A saved card that was being redone goes
++// back to saved.
++function dropDeadSettlingRows(url) {
++  state.recItems = state.recItems.filter((it) => {
++    if (!it || it.status !== 'settling' || sameTwinDoc(it.url, url) || recRowTakeIsIn(it)) return true;
++    if (Number.isInteger(it.screen) && it.screen >= 0 && state.screens[it.screen]) {
++      it.status = 'captured';
++      delete it.settleStart;
++      return true;
++    }
++    return false;
++  });
++}
++
+ function settlingItemForUrl(url) {
+   return state.recItems.find((it) => it && it.status === 'settling' && sameTwinDoc(it.url, url)) || null;
+ }
+@@ -2392,18 +2461,29 @@ function recRowAwaitingMobile(it) {
+ function onGuestSnapStart(info) {
+   // A re-record updates an existing card — it opens no row of its own.
+   if (info && info.req && cardRetakeJobs.has(info.req)) return;
++  // Save screen now's desktop frame goes straight to its take — unless the
++  // desktop had already moved to another page: then it is that page's frame
++  // (the snap cancelled that page's own job), and it opens its row as usual.
++  if (info && info.req && saveNowDesk.has(info.req)) {
++    if (sameTwinDoc(info.url, saveNowDesk.get(info.req).url)) return;
++    saveNowDesk.delete(info.req);
++  }
++  // A new document aborts a settle that has not produced a screen yet — also
++  // when the desktop comes back to a page that already has a row or a card.
++  // A row whose take is already in stays (waiting on its phone, or behind an
++  // earlier card) — dropping it is how the previous page vanished when the
++  // user clicked the next one.
++  if (info.trigger === 'load' || info.trigger === 'force') {
++    const before = state.recItems.length;
++    dropDeadSettlingRows(info.url);
++    if (state.recItems.length !== before) renderRecScreens();
++  }
+   // Same document, new job id (query rewrite, ds-doc, twin snap). Keep the
+   // row and point it at this group so the frame can close it.
+   if (attachSnapToSettlingRow(info)) return;
+   // A second automatic load of a page already on the list is the same screen.
+   // Snap current view (force) still opens its own card.
+   if (info.trigger === 'load' && !isRerecordSession() && pageAlreadyRecording(info.url)) return;
+-  // A new document aborts a settle that has not produced a screen yet.
+-  // The row already waiting on that screen's phone stays — dropping it is how
+-  // the previous page vanished when the user clicked the next one.
+-  if (info.trigger === 'load' || info.trigger === 'force') {
+-    state.recItems = state.recItems.filter((it) => it.status !== 'settling' || recRowAwaitingMobile(it));
+-  }
+   if ((info.trigger === 'load' || info.trigger === 'force') && state.retakeArmed && state.retakeIdx >= 0 && !state.retakeGroup) {
+     const target = state.screens[state.retakeIdx];
+     const urlOk = target && (info.trigger === 'force' || retakeUrlMatches(info.url, target.url));
+@@ -2693,8 +2773,11 @@ function forceRecordViewport(as, opts = {}) {
+     // One request id for both sides: the phone frame pairs with this desktop
+     // take by id, not by URL (the phone may be on its own route for it).
+     const twin = wantsMobileTwin() && el.webviewMobile && wv !== el.webviewMobile && replaceIdx < 0;
+-    const req = twin ? nextTwinReq() : 0;
+-    if (req) twinForceFrames.set(req, null);
++    const req = twin || opts.asIs ? nextTwinReq() : 0;
++    if (twin && req) twinForceFrames.set(req, null);
++    // Save screen now: this take is the card as it is now — later frames of
++    // the page don't write over it.
++    if (opts.asIs && req) saveNowReqs.add(req);
+     wv.send('ds-snap', {
+       as: as === 'interaction' ? 'interaction' : 'screen',
+       warm,
+@@ -2704,6 +2787,7 @@ function forceRecordViewport(as, opts = {}) {
+     if (wantsMobileTwin() && el.webviewMobile && wv !== el.webviewMobile) {
+       try {
+         el.webviewMobile.send('ds-snap', { as: 'screen', warm, req, screenParams: guestScreenParams() });
++        if (opts.asIs) closePhoneJobCancelledBySnap();
+       } catch {
+         /* twin not ready */
+       }
+@@ -2711,9 +2795,11 @@ function forceRecordViewport(as, opts = {}) {
+     toast(
+       warm
+         ? 'Capturing the full screen…'
+-        : replaceIdx >= 0
+-          ? 'Refreshing this screen…'
+-          : 'Capturing a new screen…'
++        : opts.asIs
++          ? 'Saving this screen as it is now…'
++          : replaceIdx >= 0
++            ? 'Refreshing this screen…'
++            : 'Capturing a new screen…'
+     );
+   } catch (err) {
+     toast('Couldn’t capture this screen');
+@@ -3266,6 +3352,154 @@ function refreshLiveScreen(idx) {
+   });
+ }
+ 
++// --- Save screen now --------------------------------------------------------
++// Some pages never hold still — a hero word that keeps cycling, a demo that
++// types itself out, a consent banner that reloads the page — and their card
++// keeps saving. Save screen now ends the wait: desktop and phone are taken
++// exactly as they are at that moment, and that is the card. Later frames of
++// the same page don't write over it.
++const SAVE_NOW_PHONE_WAIT_MS = 4000; // the phone may still be opening the page
++const saveNowDesk = new Map(); // req → waiting take whose desktop this frame replaces
++const saveNowReqs = new Set(); // reqs of as-is takes (new cards)
++
++function saveScreenNow(it) {
++  if (!state.recording || !state.accepting || state.savingFlow || !it) return;
++  closeRecPreview();
++  // A saved card being redone: snap it again as it is now.
++  if (Number.isInteger(it.screen) && it.screen >= 0 && state.screens[it.screen]) {
++    if (liveViewportMatchesScreen(it.screen)) forceRecordViewport('screen', { replaceIdx: it.screen });
++    else refreshLiveScreen(it.screen);
++    return;
++  }
++  const admit = state.admittingTake;
++  const waiting = admit && !admit.mobileHtml && !admit.noMobile && takeNeedsLiveMobile(admit) ? admit : null;
++  // Its desktop is in and it waits on its phone.
++  if (waiting && (recRowAwaitingMobile(it) || sameTwinDoc(waiting.url, it.url))) {
++    toast('Saving this screen as it is now…');
++    saveTakeNow(waiting);
++    return;
++  }
++  // Its page is no longer on the desktop and nothing of it was taken: there is
++  // nothing to save now.
++  const desk = activeBrowseWebview();
++  if (desk && !sameTwinDoc(webviewUrlOrAttr(desk), it.url) && !recRowTakeIsIn(it)) {
++    dropRecItem(it);
++    renderRecScreens();
++    toast('That page isn’t open any more — open it again to save it.');
++    return;
++  }
++  // An earlier card still waits on its phone, and this one is held behind it:
++  // save that one now, then this one.
++  if (waiting) {
++    toast('Saving the screen before this one first…');
++    saveTakeNow(waiting).then(() => {
++      const next = state.admittingTake;
++      if (next && next !== waiting && !next.mobileHtml && (next.group === it.group || sameTwinDoc(next.url, it.url))) {
++        saveTakeNow(next);
++      }
++    });
++    return;
++  }
++  // The page hasn't settled yet: drop that wait, take both sides now.
++  forceRecordViewport('screen', { asIs: true });
++}
++
++// A take whose desktop is in and that waits on its phone: the phone as it is
++// now (once it shows this page), and the desktop again if it is still there.
++async function saveTakeNow(take) {
++  if (!take || take.mobileHtml || take.noMobile || take.saveNow) return;
++  take.saveNow = true;
++  take.keepAsIs = true;
++  const req = nextTwinReq();
++  const desk = activeBrowseWebview();
++  if (desk && desk !== el.webviewMobile && sameTwinDoc(webviewUrlOrAttr(desk), take.url) && !isLoadingMainFrame(desk)) {
++    saveNowDesk.set(req, take);
++    try {
++      desk.send('ds-snap', { as: 'screen', warm: false, req, screenParams: guestScreenParams() });
++    } catch {
++      saveNowDesk.delete(req);
++    }
++  }
++  const phone = el.webviewMobile;
++  const waiting = () => state.recording && state.admittingTake === take && !take.mobileHtml && !take.noMobile;
++  const phoneOnPage = () =>
++    !!phone && (browseSidesManual() || (sameTwinDoc(webviewUrlOrAttr(phone), take.url) && !isLoadingMainFrame(phone)));
++  // The walk may still be taking the phone there — let it move.
++  const t0 = Date.now();
++  while (waiting() && !phoneOnPage() && Date.now() - t0 < SAVE_NOW_PHONE_WAIT_MS) await waitMs(150);
++  let sentPhone = false;
++  let froze = false;
++  if (waiting() && phoneOnPage()) {
++    // Hold the phone on this page while it is snapped.
++    freezeTwinViewport(FORCE_MOBILE_RESEND_MS + 1000);
++    froze = true;
++    take.req = req;
++    twinForceFrames.set(req, null);
++    try {
++      phone.send('ds-snap', { as: 'screen', warm: false, req, screenParams: guestScreenParams() });
++      sentPhone = true;
++    } catch {
++      /* twin gone */
++    }
++    const t1 = Date.now();
++    while (waiting() && Date.now() - t1 < FORCE_MOBILE_RESEND_MS) await waitMs(150);
++  }
++  if (waiting()) {
++    giveUpMobile(
++      take,
++      'save now',
++      'Saved the desktop now — the phone wasn’t showing this page. Use Re-record → Mobile on this card.'
++    );
++  }
++  if (sentPhone) closePhoneJobCancelledBySnap();
++  twinLog('save now', take.name || take.url, 'mobile', !!take.mobileHtml);
++  if (froze) thawTwinViewport();
++  pumpMobileTwin();
++}
++
++// The desktop frame Save screen now asked for, for a take already waiting on
++// its phone (or saved a moment ago, if the phone answered first).
++function applySaveNowDesktop(s) {
++  const target = saveNowDesk.get(s.req);
++  saveNowDesk.delete(s.req);
++  if (!target || !s.html || target.kind === 'image') return;
++  const prevLen = (target.html || '').length;
++  const committed = state.screens.includes(target);
++  if (committed) {
++    if (state.screensBytes - prevLen + s.html.length > MAX_SCREENS_BYTES) return;
++    state.screensBytes += s.html.length - prevLen;
++  }
++  target.html = s.html;
++  for (const k of ['words', 'text', 'h1', 'title', 'sample', 'sig', 'baseSig', 'skey', 'w', 'h']) {
++    if (s[k] != null && s[k] !== '') target[k] = s[k];
++  }
++  target.ui = s.ui || '';
++  twinLog('save now: desktop as it is now', target.name || target.url, prevLen, '→', s.html.length);
++  if (committed) {
++    captureWebviewThumb().then((thumb) => {
++      if (thumb) target.thumb = thumb;
++      renderRecScreens();
++    });
++  }
++  renderRecScreens();
++}
++
++// A snap sent to the phone cancels whatever job the phone was running there
++// (its guest starts the new one at once). Close the twin job it was answering,
++// or the walk waits TWIN_JOB_STALL_MS for an answer that never comes.
++function closePhoneJobCancelledBySnap() {
++  if (!state.mobileTwinCapturing) return;
++  // Only the jobs Save screen now replaces: a waiting take's, or the phone
++  // following the desktop's link. A saved card's own job is left to the walk.
++  if (state.mobileTwinScreenIdx >= 0) return;
++  const phoneUrl = webviewUrlOrAttr(el.webviewMobile);
++  const job = state.mobileTwinCurrent || '';
++  // A job still opening its page on the phone had no snap running there.
++  if (job && phoneUrl && !sameTwinDoc(job, phoneUrl)) return;
++  twinLog('save now: closing the phone job the snap cancelled', job || phoneUrl);
++  finishMobileTwinUrl(job || phoneUrl);
++}
++
+ let recBrowseView = 'split';
+ let recAutoScroll = false;
+ let pageWalked = {};
+@@ -3443,7 +3677,7 @@ function dropRecItem(item) {
+ function foldSamePageFrame(s, item) {
+   if (state.admittingTake && sameTwinDoc(state.admittingTake.url, s.url)) {
+     const take = state.admittingTake;
+-    if ((s.html || '').length > (take.html || '').length) {
++    if (!take.keepAsIs && (s.html || '').length > (take.html || '').length) {
+       take.html = s.html;
+       if (s.title) take.title = s.title;
+       if (s.h1) take.h1 = s.h1;
+@@ -3457,7 +3691,7 @@ function foldSamePageFrame(s, item) {
+     const prev = state.screens[i];
+     if (!prev || prev.kind === 'image' || !sameTwinDoc(prev.url, s.url)) continue;
+     const prevLen = (prev.html || '').length;
+-    if ((s.html || '').length > prevLen) {
++    if (!prev.keepAsIs && (s.html || '').length > prevLen) {
+       prev.html = s.html;
+       state.screensBytes += s.html.length - prevLen;
+       if (s.title) prev.title = s.title;
+@@ -3886,7 +4120,7 @@ function syncRecPreviewChrome() {
+   const idxs = recPreviewableIdxs();
+   const at = idxs.indexOf(idx);
+   $('studio-modal-title').textContent = screen ? screenNavDisplayName(screen, idx) : 'Preview';
+-  const captureNums = captureScreenNumbers(state.screens);
++  const captureNums = liveScreenNumbering();
+   const captureLabel = Number.isInteger(idx) ? captureNums.map.get(idx) : '';
+   const captureTotal = captureNums.majors || idxs.length;
+   $('studio-modal-step').textContent = captureLabel ? `${captureLabel} / ${captureTotal}` : idxs.length ? `${at + 1} / ${idxs.length}` : '';
+@@ -4295,6 +4529,10 @@ function commitCapturedScreen(s, item, step) {
+     delete item.settleStart;
+     delete item.loadingHtml;
+     delete item.loadingThumb;
++  } else if (!state.recItems.some((it) => it && it.screen === idx)) {
++    // Its row was dropped or moved on to a newer frame while this take waited:
++    // the screen still gets a row, so the panel lists what the flow strip shows.
++    state.recItems.push({ group: s.group, status: 'captured', screen: idx, label: s.name, url: s.url || '', ts: s.ts || Date.now() });
+   }
+   dropSettlingForDoc(s.url, item);
+   attachPendingMobile(s.url);
+@@ -4312,7 +4550,7 @@ function applyDesktopFill(s) {
+     [state.admittingTake, ...state.pendingDesktopTakes, ...state.screens].find(
+       (t) => t && t.kind !== 'image' && t.group === s.group
+     );
+-  if (!target) return;
++  if (!target || target.keepAsIs) return;
+   const prevLen = (target.html || '').length;
+   if ((s.html || '').length <= prevLen) return;
+   const committed = state.screens.includes(target);
+@@ -4346,6 +4584,17 @@ function onGuestScreen(s) {
+     applyCardRetakeFrame('desktop', s);
+     return;
+   }
++  if (s.req && saveNowDesk.has(s.req)) {
++    if (sameTwinDoc(s.url, saveNowDesk.get(s.req).url)) {
++      if (s.state !== 'loading' && !s.fill) applySaveNowDesktop(s);
++      return;
++    }
++    saveNowDesk.delete(s.req);
++  }
++  if (s.req && saveNowReqs.has(s.req) && s.state !== 'loading' && !s.fill) {
++    saveNowReqs.delete(s.req);
++    s.keepAsIs = true;
++  }
+   if (s.fill) {
+     applyDesktopFill(s);
+     return;
+@@ -5307,6 +5556,8 @@ function renderRecScreens() {
+   }
+   if (!rerecord && state.recording) ensureRecSel(false);
+   const rows = recDisplayItems();
++  const numbering = liveScreenNumbering();
++  let pendingAt = 0;
+   const lastIdx = lastCapturedScreenIdx();
+   const follow = !rerecord && state.recSelIdx === lastIdx;
+   let selectedRowAt = -1;
+@@ -5425,8 +5676,26 @@ function renderRecScreens() {
+     body.className = 'rec-screen-body';
+     const name = document.createElement('div');
+     name.className = 'rec-screen-name';
++    // Its number in the recording — the one on its flow-strip card. A page
++    // still saving shows the number it is about to get.
++    let numText = s ? numbering.map.get(it.screen) || '' : '';
++    const numPending = !s && it.status === 'settling';
++    if (numPending) {
++      pendingAt += 1;
++      numText = String(numbering.majors + pendingAt);
++    }
++    if (numText) {
++      const num = document.createElement('span');
++      num.className = `rec-screen-num${numPending ? ' is-pending' : ''}`;
++      num.textContent = numText;
++      num.title = numPending ? `Becomes screen ${numText}` : `Screen ${numText}`;
++      name.appendChild(num);
++    }
+     const ver = s ? recVersionLabel(s) : '';
+-    name.textContent = (s ? screenLabel(s, it.screen) : it.label) + (ver ? `  ${ver}` : '');
++    const title = document.createElement('span');
++    title.className = 'rec-screen-title';
++    title.textContent = (s ? screenLabel(s, it.screen) : it.label) + (ver ? `  ${ver}` : '');
++    name.appendChild(title);
+     const meta = document.createElement('div');
+     meta.className = 'rec-screen-meta';
+     meta.textContent =
+@@ -5439,7 +5708,7 @@ function renderRecScreens() {
+         : it.status === 'layer'
+           ? `Saved on ${s ? screenLabel(s, it.screen) : 'this screen'}`
+           : it.status === 'linked'
+-          ? `Back to screen ${it.screen + 1}`
++          ? `Back to screen ${numbering.map.get(it.screen) || it.screen + 1}`
+           : it.status === 'skipped'
+             ? 'Skipped — recording is full'
+             : hostnameOf(it.url) + (s && s.url ? pathOf(s.url) + (screenParamsLabel(s.url) ? ` · ${screenParamsLabel(s.url)}` : '') : '');
+@@ -5461,11 +5730,9 @@ function renderRecScreens() {
+       const box = document.createElement('div');
+       box.className = 'rec-screen-actions';
+       box.appendChild(
+-        recActionButton('Refresh screen', () => {
+-          if (Number.isInteger(it.screen) && it.screen >= 0) refreshLiveScreen(it.screen);
+-          else forceRecordViewport('screen');
+-        }, {
+-          title: 'Captures the live page into this take. Does not reload.',
++        recActionButton('Save screen now', () => saveScreenNow(it), {
++          title:
++            'Stop waiting for this page to settle and save it exactly as it looks right now, on desktop and mobile. Does not reload.',
+         })
+       );
+       row.appendChild(box);
+@@ -5749,26 +6016,41 @@ function syncUrlbar({ keepTyping = false } = {}) {
+   el.urlbar.value = urlbarSideUrl();
+ }
+ 
++// The URL bar's view buttons: Desktop + mobile, Desktop or Mobile. They are
++// View as from the recording panel, so picking one changes the stage, and
++// each follows the other. (Tablet is only in View as; no button is on then.)
++const URLBAR_VIEW_OF = { both: 'split', desktop: 'desktop', mobile: 'mobile' };
++
+ function syncUrlTargetUi() {
+   const box = $('url-target');
+   if (!box) return;
+-  const show = state.mode === 'browser' && recBrowseView === 'split' && !isMobilePrimaryCapture() && phoneStageActive();
++  const pageOn = isRecordableUrl(state.currentUrl) && !(el.browserEmpty && !el.browserEmpty.hidden);
++  const show = state.mode === 'browser' && !isMobilePrimaryCapture() && pageOn;
+   box.hidden = !show;
+   box.querySelectorAll('button[data-t]').forEach((b) => {
+-    const on = b.dataset.t === urlTarget;
++    const on = URLBAR_VIEW_OF[b.dataset.t] === recBrowseView;
+     b.classList.toggle('on', on);
+     b.setAttribute('aria-checked', String(on));
+   });
++  // Manual sides (a re-record whose desktop and phone links differ): the bar
++  // drives one side only. The view buttons stay on Desktop + mobile.
++  const manual = show && browseSidesManual();
+   const wrap = el.urlbar?.closest('.urlbar-wrap');
+-  wrap?.classList.toggle('is-side', urlTarget !== 'both' && show);
++  wrap?.classList.toggle('is-side', manual);
+   wrap?.classList.toggle('has-target', show);
+ 
+   if (el.urlbar) {
+     el.urlbar.placeholder =
+-      show && urlTarget === 'mobile' ? 'Mobile link — only the phone goes there' : show && urlTarget === 'desktop' ? 'Desktop link — only the desktop goes there' : 'Search or enter URL';
++      manual && urlTarget === 'mobile' ? 'Mobile link — only the phone goes there' : manual && urlTarget === 'desktop' ? 'Desktop link — only the desktop goes there' : 'Search or enter URL';
+   }
+ }
+ 
++function setBrowseViewFromUrlbar(t) {
++  const view = URLBAR_VIEW_OF[t] || 'split';
++  if (view === recBrowseView) return;
++  setRecBrowseView(view);
++}
++
+ function setUrlTarget(next) {
+   const t = next === 'desktop' || next === 'mobile' ? next : 'both';
+   if (t === urlTarget) return;
+@@ -7101,6 +7383,8 @@ function startRecording() {
+   state.loadingByGroup = {};
+   state.pendingMobile = {};
+   twinForceFrames.clear();
++  saveNowDesk.clear();
++  saveNowReqs.clear();
+   retakeGroupCard.clear();
+   clearCardRetakes();
+   state.pendingDesktopTakes = [];
+@@ -9445,6 +9729,13 @@ function captureScreenNumbers(screens) {
+   return { map, majors: major };
+ }
+ 
++// While recording, every screen has one number, the same on its card in the
++// right panel, in the flow strip and in the preview: its place in the
++// recording (1, 2, 3; a loading card after screen 2 is 2.1).
++function liveScreenNumbering() {
++  return captureScreenNumbers((state.screens || []).map((s) => (s && !isVideoStill(s) ? s : null)));
++}
++
+ function screenyReady(data = state.openData) {
+   return !!data;
+ }
+@@ -10264,7 +10555,7 @@ function renderFlowDock() {
+     unavailBtn.setAttribute('aria-pressed', String(!!allOff));
+     unavailBtn.classList.toggle('on', !!allOff);
+   }
+-  const nums = live ? null : screenNavNumbers();
++  const nums = live ? liveScreenNumbering().map : screenNavNumbers();
+   flowDockSyncOmitted(screens, device, nums);
+   const track = $('flow-dock-track');
+   const nextSig = `${indexes.join(',')}|${device}|${zoom}|${live ? 'live' : (state.flowDockId || '')}`;
+@@ -23500,7 +23791,7 @@ function wireControls() {
+   $('url-target')?.querySelectorAll('button[data-t]').forEach((b) => {
+     const kind = b.dataset.t === 'both' ? 'split' : b.dataset.t;
+     b.innerHTML = deviceIconHtml(kind);
+-    b.onclick = () => setUrlTarget(b.dataset.t);
++    b.onclick = () => setBrowseViewFromUrlbar(b.dataset.t);
+   });
+   el.heroUrl.addEventListener('keydown', (e) => {
+     if (e.key === 'Enter') navigateTo(el.heroUrl.value);
+diff --git a/renderer/index.html b/renderer/index.html
+index 7b0a177..a334b4b 100644
+--- a/renderer/index.html
++++ b/renderer/index.html
+@@ -44,10 +44,10 @@
+           <div class="urlbar-wrap">
+             <span class="rec-dot" id="urlbar-rec-dot" hidden></span>
+             <input id="urlbar" class="urlbar" type="text" placeholder="Search or enter URL" spellcheck="false" autocomplete="off" />
+-            <div class="url-target" id="url-target" role="radiogroup" aria-label="Link for" hidden>
+-              <button type="button" data-t="both" class="on" role="radio" aria-checked="true" title="Both — desktop and mobile follow the same walk"></button>
+-              <button type="button" data-t="desktop" role="radio" aria-checked="false" title="Desktop link — show and edit only the desktop's link; the phone stays put"></button>
+-              <button type="button" data-t="mobile" role="radio" aria-checked="false" title="Mobile link — show and edit only the phone's link; the desktop stays put"></button>
++            <div class="url-target" id="url-target" role="radiogroup" aria-label="View as" hidden>
++              <button type="button" data-t="both" class="on" role="radio" aria-checked="true" aria-label="Desktop and mobile side by side" title="Desktop + mobile — both side by side, on the same walk"></button>
++              <button type="button" data-t="desktop" role="radio" aria-checked="false" aria-label="Desktop" title="Desktop — show the desktop only"></button>
++              <button type="button" data-t="mobile" role="radio" aria-checked="false" aria-label="Mobile" title="Mobile — show the phone only"></button>
+             </div>
+             <div class="urlbar-progress" id="urlbar-progress" hidden></div>
+             <div class="urlbar-capture" id="urlbar-capture" hidden></div>
+@@ -447,7 +447,7 @@
+                 <div class="rec-counters" id="rec-counters">0 screens · 0 flows</div>
+                 <div class="rec-screens" id="rec-screens" aria-live="polite"></div>
+                 <div class="rec-live-actions">
+-                  <button type="button" class="ghost-pill primary full" id="btn-record-viewport" title="Snaps the current view of the live page as a new screen, without reloading. To recapture a take, use Refresh screen.">
++                  <button type="button" class="ghost-pill primary full" id="btn-record-viewport" title="Snaps the current view of the live page as a new screen, without reloading. A card that keeps saving has Save screen now.">
+                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 8v8M8 12h8"/></svg>
+                     Snap current view
+                   </button>
+diff --git a/renderer/styles.css b/renderer/styles.css
+index 41f72ca..d7d1d1d 100644
+--- a/renderer/styles.css
++++ b/renderer/styles.css
+@@ -4218,12 +4218,39 @@ body:has(#rec-urls-dialog:not([hidden])) #toast-layer {
+   flex: 1;
+ }
+ .rec-screen-name {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  min-width: 0;
+   font-size: 12px;
+   font-weight: 600;
++}
++.rec-screen-title {
++  min-width: 0;
+   white-space: nowrap;
+   overflow: hidden;
+   text-overflow: ellipsis;
+ }
++/* Same number as the screen's card in the flow strip. */
++.rec-screen-num {
++  flex: 0 0 auto;
++  min-width: 18px;
++  height: 18px;
++  padding: 0 5px;
++  border-radius: 999px;
++  background: rgba(255, 255, 255, 0.14);
++  color: #fff;
++  font-size: 11px;
++  font-weight: 650;
++  line-height: 18px;
++  text-align: center;
++  font-variant-numeric: tabular-nums;
++}
++.rec-screen-num.is-pending {
++  background: transparent;
++  box-shadow: inset 0 0 0 1px var(--border-strong);
++  color: var(--text-muted);
++}
+ .rec-screen-meta {
+   font-size: 11px;
+   color: var(--text-muted);
+-- 
+2.43.0
+
